@@ -77,6 +77,7 @@ Q_LOGGING_CATEGORY(lcQpaAccessibility, "qt.qpa.accessibility")
 Q_LOGGING_CATEGORY(lcQpaUiAutomation, "qt.qpa.uiautomation")
 Q_LOGGING_CATEGORY(lcQpaTrayIcon, "qt.qpa.trayicon")
 Q_LOGGING_CATEGORY(lcQpaScreen, "qt.qpa.screen")
+Q_LOGGING_CATEGORY(lcQpaTheme, "qt.qpa.theme")
 
 int QWindowsContext::verbose = 0;
 
@@ -320,10 +321,6 @@ QWindowsContext::QWindowsContext() :
 #    pragma warning( disable : 4996 )
 #endif
     m_instance = this;
-    // ### FIXME: Remove this once the logging system has other options of configurations.
-    const QByteArray bv = qgetenv("QT_QPA_VERBOSE");
-    if (!bv.isEmpty())
-        QLoggingCategory::setFilterRules(QString::fromLocal8Bit(bv));
 }
 
 QWindowsContext::~QWindowsContext()
@@ -337,6 +334,9 @@ QWindowsContext::~QWindowsContext()
 
     if (d->m_powerDummyWindow)
         DestroyWindow(d->m_powerDummyWindow);
+
+    if (QWindowsTheme *theme = QWindowsTheme::instance())
+        theme->destroyThemeChangeWindow();
 
     d->m_screenManager.destroyWindow();
 
@@ -411,7 +411,7 @@ bool QWindowsContext::disposeTablet()
 #endif
 }
 
-extern "C" LRESULT QT_WIN_CALLBACK qWindowsPowerWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+LRESULT QT_WIN_CALLBACK qWindowsPowerWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     if (message != WM_POWERBROADCAST || wParam != PBT_POWERSETTINGCHANGE)
         return DefWindowProc(hwnd, message, wParam, lParam);
@@ -1209,11 +1209,6 @@ bool QWindowsContext::windowsProc(HWND hwnd, UINT message,
 #endif
     case QtWindows::SettingChangedEvent: {
         QWindowsWindow::settingsChanged();
-        // Only refresh the window theme if the user changes the personalize settings.
-        if ((wParam == 0) && (lParam != 0) // lParam sometimes may be NULL.
-            && (wcscmp(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") == 0)) {
-            QWindowsTheme::handleSettingsChanged();
-        }
         return d->m_screenManager.handleScreenChanges();
     }
     default:
@@ -1301,9 +1296,13 @@ bool QWindowsContext::windowsProc(HWND hwnd, UINT message,
     case QtWindows::MoveEvent:
         platformWindow->handleMoved();
         return true;
-    case QtWindows::ResizeEvent:
+    case QtWindows::ResizeEvent: {
+        QWindow *window = platformWindow->window();
         platformWindow->handleResized(static_cast<int>(wParam), lParam);
+        if (window->flags().testFlags(Qt::ExpandedClientAreaHint))
+            platformWindow->updateCustomTitlebar();
         return true;
+    }
     case QtWindows::QuerySizeHints:
         platformWindow->getSizeHints(reinterpret_cast<MINMAXINFO *>(lParam));
         return true;// maybe available on some SDKs revisit WM_NCCALCSIZE
@@ -1315,10 +1314,16 @@ bool QWindowsContext::windowsProc(HWND hwnd, UINT message,
             platformWindow->updateCustomTitlebar();
         return platformWindow->handleNonClientHitTest(QPoint(msg.pt.x, msg.pt.y), result);
     }
+    case QtWindows::NonClientActivate:
+        return platformWindow->handleNonClientActivate(result);
     case QtWindows::GeometryChangingEvent:
         return platformWindow->handleGeometryChanging(&msg);
-    case QtWindows::ExposeEvent:
+    case QtWindows::ExposeEvent: {
+        QWindow *window = platformWindow->window();
+        if (window->flags().testFlags(Qt::ExpandedClientAreaHint))
+            platformWindow->updateCustomTitlebar();
         return platformWindow->handleWmPaint(hwnd, message, wParam, lParam, result);
+    }
     case QtWindows::NonClientMouseEvent:
         if (!platformWindow->frameStrutEventsEnabled())
             break;
@@ -1379,10 +1384,6 @@ bool QWindowsContext::windowsProc(HWND hwnd, UINT message,
         QWindowSystemInterface::handleCloseEvent(platformWindow->window());
         return true;
     case QtWindows::ThemeChanged: {
-        QWindowsThemeCache::clearThemeCache(platformWindow->handle());
-        // Switch from Aero to Classic changes margins.
-        if (QWindowsTheme *theme = QWindowsTheme::instance())
-            theme->windowsThemeChanged(platformWindow->window());
         return true;
     }
     case QtWindows::CompositionSettingsChanged:
@@ -1640,7 +1641,7 @@ static inline bool isTopLevel(HWND hwnd)
 
 */
 
-extern "C" LRESULT QT_WIN_CALLBACK qWindowsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+LRESULT QT_WIN_CALLBACK qWindowsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     LRESULT result;
     const QtWindows::WindowsEventType et = windowsEventType(message, wParam, lParam);

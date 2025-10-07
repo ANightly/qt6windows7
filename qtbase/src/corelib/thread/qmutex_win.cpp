@@ -27,4 +27,4 @@ bool QMutexPrivate::wait(QDeadlineTimer timeout)
 void QMutexPrivate::wakeUp() noexcept
 { SetEvent(event); }
 
-QT_END_NAMESPACE
+QT_END_NAMESPACE

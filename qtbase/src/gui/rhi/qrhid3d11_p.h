@@ -180,6 +180,14 @@ struct QD3D11TextureRenderTarget : public QRhiTextureRenderTarget
     friend class QRhiD3D11;
 };
 
+struct RenderTargetUavUpdateState
+{
+    ID3D11RenderTargetView *rtv[QD3D11RenderTargetData::MAX_COLOR_ATTACHMENTS];
+    ID3D11DepthStencilView *dsv = nullptr;
+    std::array<ID3D11UnorderedAccessView *, QD3D11RenderTargetData::MAX_COLOR_ATTACHMENTS> uav;
+    bool update(QD3D11RenderTargetData *data, ID3D11UnorderedAccessView * const *uavs = nullptr, int count = 0);
+};
+
 struct QD3D11ShaderResourceBindings : public QRhiShaderResourceBindings
 {
     QD3D11ShaderResourceBindings(QRhiImplementation *rhi);
@@ -285,6 +293,7 @@ struct QD3D11ShaderResourceBindings : public QRhiShaderResourceBindings
     StageSamplerBatches csSamplerBatches;
 
     StageUavBatches csUavBatches;
+    StageUavBatches fsUavBatches;
 
     friend class QRhiD3D11;
 };
@@ -521,6 +530,7 @@ struct QD3D11CommandBuffer : public QRhiCommandBuffer
     DXGI_FORMAT currentIndexFormat;
     ID3D11Buffer *currentVertexBuffers[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
     quint32 currentVertexOffsets[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    QD3D11RenderTargetData *prevRtD;
 
     QVarLengthArray<QByteArray, 4> dataRetainPool;
     QVarLengthArray<QRhiBufferData, 4> bufferDataRetainPool;
@@ -549,6 +559,7 @@ struct QD3D11CommandBuffer : public QRhiCommandBuffer
         recordingPass = NoPass;
         // do not zero lastGpuTime
         currentTarget = nullptr;
+        prevRtD = nullptr;
         resetCommands();
         resetCachedState();
     }
@@ -630,6 +641,15 @@ struct QD3D11SwapChain : public QRhiSwapChain
     int lastFrameLatencyWaitSlot = -1;
 };
 
+class QD3D11Adapter : public QRhiAdapter
+{
+public:
+    QRhiDriverInfo info() const override;
+
+    LUID luid;
+    QRhiDriverInfo adapterInfo;
+};
+
 class QRhiD3D11 : public QRhiImplementation
 {
 public:
@@ -637,6 +657,7 @@ public:
 
     bool create(QRhi::Flags flags) override;
     void destroy() override;
+    QRhi::AdapterList enumerateAdaptersBeforeCreate(QRhiNativeHandles *nativeHandles) const override;
 
     QRhiGraphicsPipeline *createGraphicsPipeline() override;
     QRhiComputePipeline *createComputePipeline() override;
@@ -753,10 +774,11 @@ public:
     void updateShaderResourceBindings(QD3D11ShaderResourceBindings *srbD,
                                       const QShader::NativeResourceBindingMap *nativeResourceBindingMaps[]);
     void executeBufferHostWrites(QD3D11Buffer *bufD);
+
     void bindShaderResources(QD3D11ShaderResourceBindings *srbD,
                              const uint *dynOfsPairs, int dynOfsPairCount,
-                             bool offsetOnlyChange);
-    void resetShaderResources();
+                             bool offsetOnlyChange, QD3D11RenderTargetData *rtD, RenderTargetUavUpdateState &rtUavState);
+    void resetShaderResources(QD3D11RenderTargetData *rtD, RenderTargetUavUpdateState &rtUavState);
     void executeCommandBuffer(QD3D11CommandBuffer *cbD);
     DXGI_SAMPLE_DESC effectiveSampleDesc(int sampleCount) const;
     void finishActiveReadbacks();
@@ -794,6 +816,7 @@ public:
         int fsHighestActiveSrvBinding = -1;
         int csHighestActiveSrvBinding = -1;
         int csHighestActiveUavBinding = -1;
+        int fsHighestActiveUavBinding = -1;
         QD3D11SwapChain *currentSwapChain = nullptr;
     } contextState;
 

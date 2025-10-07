@@ -372,6 +372,24 @@ HRESULT QWindowsUiaMainProvider::GetPatternProvider(PATTERNID idPattern, IUnknow
     return S_OK;
 }
 
+void QWindowsUiaMainProvider::setLabelledBy(QAccessibleInterface *accessible, VARIANT *pRetVal)
+{
+    Q_ASSERT(accessible);
+
+    typedef std::pair<QAccessibleInterface*, QAccessible::Relation> RelationPair;
+    const QList<RelationPair> relationInterfaces = accessible->relations(QAccessible::Label);
+    if (relationInterfaces.empty())
+        return;
+
+    // UIA_LabeledByPropertyId only supports one relation
+    ComPtr<IRawElementProviderSimple> provider = providerForAccessible(relationInterfaces.first().first);
+    if (!provider)
+        return;
+
+    pRetVal->vt = VT_UNKNOWN;
+    pRetVal->punkVal = provider.Detach();
+}
+
 void QWindowsUiaMainProvider::fillVariantArrayForRelation(QAccessibleInterface* accessible,
                                                           QAccessible::Relation relation, VARIANT *pRetVal)
 {
@@ -522,6 +540,20 @@ HRESULT QWindowsUiaMainProvider::GetPropertyValue(PROPERTYID idProp, VARIANT *pR
             *pRetVal = QComVariant{ className }.release();
         }
         break;
+    case UIA_CulturePropertyId:
+    {
+        QLocale locale;
+        if (QAccessibleAttributesInterface *attributesIface = accessible->attributesInterface()) {
+            const QVariant localeVariant = attributesIface->attributeValue(QAccessible::Attribute::Locale);
+            if (localeVariant.isValid()) {
+                Q_ASSERT(localeVariant.canConvert<QLocale>());
+                locale = localeVariant.toLocale();
+            }
+        }
+        LCID lcid = LocaleNameToLCID(qUtf16Printable(locale.bcp47Name()), 0);
+        *pRetVal = QComVariant{ long(lcid) }.release();
+        break;
+    }
     case UIA_DescribedByPropertyId:
         fillVariantArrayForRelation(accessible, QAccessible::DescriptionFor, pRetVal);
         break;
@@ -530,6 +562,9 @@ HRESULT QWindowsUiaMainProvider::GetPropertyValue(PROPERTYID idProp, VARIANT *pR
         break;
     case UIA_FlowsToPropertyId:
         fillVariantArrayForRelation(accessible, QAccessible::FlowsFrom, pRetVal);
+        break;
+    case UIA_LabeledByPropertyId:
+        setLabelledBy(accessible, pRetVal);
         break;
     case UIA_FrameworkIdPropertyId:
         *pRetVal = QComVariant{ QStringLiteral("Qt") }.release();

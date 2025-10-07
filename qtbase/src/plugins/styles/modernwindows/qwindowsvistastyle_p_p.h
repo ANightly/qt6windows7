@@ -67,7 +67,9 @@
 #if QT_CONFIG(dialogbuttonbox)
 #include <qdialogbuttonbox.h>
 #endif
+#if QT_CONFIG(inputdialog)
 #include <qinputdialog.h>
+#endif
 #if QT_CONFIG(tableview)
 #include <qtableview.h>
 #endif

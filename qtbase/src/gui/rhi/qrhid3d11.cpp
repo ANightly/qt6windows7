@@ -266,7 +266,10 @@ bool QRhiD3D11::create(QRhi::Flags flags)
         if (qEnvironmentVariableIsSet("QT_D3D_ADAPTER_INDEX"))
             requestedAdapterIndex = qEnvironmentVariableIntValue("QT_D3D_ADAPTER_INDEX");
 
-        // The importParams may specify an adapter by the luid, take that into account.
+        if (requestedRhiAdapter)
+            adapterLuid = static_cast<QD3D11Adapter *>(requestedRhiAdapter)->luid;
+
+        // importParams or requestedRhiAdapter may specify an adapter by the luid, use that in the absence of an env.var. override.
         if (requestedAdapterIndex < 0 && (adapterLuid.LowPart || adapterLuid.HighPart)) {
             for (int adapterIndex = 0; dxgiFactory->EnumAdapters1(UINT(adapterIndex), &adapter) != DXGI_ERROR_NOT_FOUND; ++adapterIndex) {
                 DXGI_ADAPTER_DESC1 desc;
@@ -489,6 +492,9 @@ void QRhiD3D11::destroy()
         dxgiFactory = nullptr;
     }
 
+    importedDeviceAndContext = false;
+    adapterLuid = {};
+
     QDxgiVSyncService::instance()->derefAdapter(adapterLuid);
 }
 
@@ -500,6 +506,48 @@ void QRhiD3D11::reportLiveObjects(ID3D11Device *device)
         debug->ReportLiveDeviceObjects(D3D11_RLDO_DETAIL);
         debug->Release();
     }
+}
+
+QRhi::AdapterList QRhiD3D11::enumerateAdaptersBeforeCreate(QRhiNativeHandles *nativeHandles) const
+{
+    LUID requestedLuid = {};
+    if (nativeHandles) {
+        QRhiD3D11NativeHandles *h = static_cast<QRhiD3D11NativeHandles *>(nativeHandles);
+        const LUID adapterLuid = { h->adapterLuidLow, h->adapterLuidHigh };
+        if (adapterLuid.LowPart || adapterLuid.HighPart)
+            requestedLuid = adapterLuid;
+    }
+
+    IDXGIFactory1 *dxgi = createDXGIFactory2();
+    if (!dxgi)
+        return {};
+
+    QRhi::AdapterList list;
+    IDXGIAdapter1 *adapter;
+    for (int adapterIndex = 0; dxgi->EnumAdapters1(UINT(adapterIndex), &adapter) != DXGI_ERROR_NOT_FOUND; ++adapterIndex) {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter->GetDesc1(&desc);
+        adapter->Release();
+        if (requestedLuid.LowPart || requestedLuid.HighPart) {
+            if (desc.AdapterLuid.LowPart != requestedLuid.LowPart
+                || desc.AdapterLuid.HighPart != requestedLuid.HighPart)
+            {
+                continue;
+            }
+        }
+        QD3D11Adapter *a = new QD3D11Adapter;
+        a->luid = desc.AdapterLuid;
+        QRhiD3D::fillDriverInfo(&a->adapterInfo, desc);
+        list.append(a);
+    }
+
+    dxgi->Release();
+    return list;
+}
+
+QRhiDriverInfo QD3D11Adapter::info() const
+{
+    return adapterInfo;
 }
 
 QList<int> QRhiD3D11::supportedSampleCounts() const
@@ -1610,6 +1658,8 @@ static inline DXGI_FORMAT toD3DTextureFormat(QRhiTexture::Format format, QRhiTex
         return srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
     case QRhiTexture::R8:
         return DXGI_FORMAT_R8_UNORM;
+    case QRhiTexture::R8SI:
+        return DXGI_FORMAT_R8_SINT;
     case QRhiTexture::R8UI:
         return DXGI_FORMAT_R8_UINT;
     case QRhiTexture::RG8:
@@ -1633,10 +1683,16 @@ static inline DXGI_FORMAT toD3DTextureFormat(QRhiTexture::Format format, QRhiTex
     case QRhiTexture::RGB10A2:
         return DXGI_FORMAT_R10G10B10A2_UNORM;
 
+    case QRhiTexture::R32SI:
+        return DXGI_FORMAT_R32_SINT;
     case QRhiTexture::R32UI:
         return DXGI_FORMAT_R32_UINT;
+    case QRhiTexture::RG32SI:
+        return DXGI_FORMAT_R32G32_SINT;
     case QRhiTexture::RG32UI:
         return DXGI_FORMAT_R32G32_UINT;
+    case QRhiTexture::RGBA32SI:
+        return DXGI_FORMAT_R32G32B32A32_SINT;
     case QRhiTexture::RGBA32UI:
         return DXGI_FORMAT_R32G32B32A32_UINT;
 
@@ -1963,7 +2019,7 @@ void QRhiD3D11::enqueueResourceUpdates(QRhiCommandBuffer *cb, QRhiResourceUpdate
 
             ID3D11Resource *src;
             DXGI_FORMAT dxgiFormat;
-            QSize pixelSize;
+            QRect rect;
             QRhiTexture::Format format;
             UINT subres = 0;
             QD3D11Texture *texD = QRHI_RES(QD3D11Texture, u.rb.texture());
@@ -1977,7 +2033,10 @@ void QRhiD3D11::enqueueResourceUpdates(QRhiCommandBuffer *cb, QRhiResourceUpdate
                 }
                 src = texD->textureResource();
                 dxgiFormat = texD->dxgiFormat;
-                pixelSize = q->sizeForMipLevel(u.rb.level(), texD->m_pixelSize);
+                if (u.rb.rect().isValid())
+                    rect = u.rb.rect();
+                else
+                    rect = QRect({0, 0}, q->sizeForMipLevel(u.rb.level(), texD->m_pixelSize));
                 format = texD->m_format;
                 is3D = texD->m_flags.testFlag(QRhiTexture::ThreeDimensional);
                 subres = D3D11CalcSubresource(UINT(u.rb.level()), UINT(is3D ? 0 : u.rb.layer()), texD->mipLevelCount);
@@ -1997,18 +2056,21 @@ void QRhiD3D11::enqueueResourceUpdates(QRhiCommandBuffer *cb, QRhiResourceUpdate
                 }
                 src = swapChainD->backBufferTex;
                 dxgiFormat = swapChainD->colorFormat;
-                pixelSize = swapChainD->pixelSize;
+                if (u.rb.rect().isValid())
+                    rect = u.rb.rect();
+                else
+                    rect = QRect({0, 0}, swapChainD->pixelSize);
                 format = swapchainReadbackTextureFormat(dxgiFormat, nullptr);
                 if (format == QRhiTexture::UnknownFormat)
                     continue;
             }
             quint32 byteSize = 0;
             quint32 bpl = 0;
-            textureFormatInfo(format, pixelSize, &bpl, &byteSize, nullptr);
+            textureFormatInfo(format, rect.size(), &bpl, &byteSize, nullptr);
 
             D3D11_TEXTURE2D_DESC desc = {};
-            desc.Width = UINT(pixelSize.width());
-            desc.Height = UINT(pixelSize.height());
+            desc.Width = UINT(rect.width());
+            desc.Height = UINT(rect.height());
             desc.MipLevels = 1;
             desc.ArraySize = 1;
             desc.Format = dxgiFormat;
@@ -2032,22 +2094,22 @@ void QRhiD3D11::enqueueResourceUpdates(QRhiCommandBuffer *cb, QRhiResourceUpdate
             cmd.args.copySubRes.dstZ = 0;
             cmd.args.copySubRes.src = src;
             cmd.args.copySubRes.srcSubRes = subres;
-            if (is3D) {
-                D3D11_BOX srcBox = {};
-                srcBox.front = UINT(u.rb.layer());
-                srcBox.right = desc.Width; // exclusive
-                srcBox.bottom = desc.Height;
-                srcBox.back = srcBox.front + 1;
-                cmd.args.copySubRes.hasSrcBox = true;
-                cmd.args.copySubRes.srcBox = srcBox;
-            } else {
-                cmd.args.copySubRes.hasSrcBox = false;
-            }
+
+            D3D11_BOX srcBox = {};
+            srcBox.left = UINT(rect.left());
+            srcBox.top = UINT(rect.top());
+            srcBox.front = is3D ? UINT(u.rb.layer()) : 0u;
+            // back, right, bottom are exclusive
+            srcBox.right = srcBox.left + desc.Width;
+            srcBox.bottom = srcBox.top + desc.Height;
+            srcBox.back = srcBox.front + 1;
+            cmd.args.copySubRes.hasSrcBox = true;
+            cmd.args.copySubRes.srcBox = srcBox;
 
             readback.stagingTex = stagingTex;
             readback.byteSize = byteSize;
             readback.bpl = bpl;
-            readback.pixelSize = pixelSize;
+            readback.pixelSize = rect.size();
             readback.format = format;
 
             activeTextureReadbacks.append(readback);
@@ -2170,10 +2232,10 @@ void QRhiD3D11::beginPass(QRhiCommandBuffer *cb,
     if (rtD->dsAttCount && wantsDsClear)
         clearCmd.args.clear.mask |= QD3D11CommandBuffer::Command::Depth | QD3D11CommandBuffer::Command::Stencil;
 
-    clearCmd.args.clear.c[0] = float(colorClearValue.redF());
-    clearCmd.args.clear.c[1] = float(colorClearValue.greenF());
-    clearCmd.args.clear.c[2] = float(colorClearValue.blueF());
-    clearCmd.args.clear.c[3] = float(colorClearValue.alphaF());
+    clearCmd.args.clear.c[0] = colorClearValue.redF();
+    clearCmd.args.clear.c[1] = colorClearValue.greenF();
+    clearCmd.args.clear.c[2] = colorClearValue.blueF();
+    clearCmd.args.clear.c[3] = colorClearValue.alphaF();
     clearCmd.args.clear.d = depthStencilClearValue.depthClearValue();
     clearCmd.args.clear.s = depthStencilClearValue.stencilClearValue();
 
@@ -2348,6 +2410,7 @@ void QRhiD3D11::updateShaderResourceBindings(QD3D11ShaderResourceBindings *srbD,
     srbD->csSamplerBatches.clear();
 
     srbD->csUavBatches.clear();
+    srbD->fsUavBatches.clear();
 
     struct Stage {
         struct Buffer {
@@ -2543,8 +2606,15 @@ void QRhiD3D11::updateShaderResourceBindings(QD3D11ShaderResourceBindings *srbD,
                     if (uav)
                         res[RBM_COMPUTE].uavs.append({ nativeBinding.first, uav });
                 }
+            } else if (b->stage.testFlag(QRhiShaderResourceBinding::FragmentStage)) {
+                QPair<int, int> nativeBinding = mapBinding(b->binding, RBM_FRAGMENT, nativeResourceBindingMaps);
+                if (nativeBinding.first >= 0) {
+                    ID3D11UnorderedAccessView *uav = texD->unorderedAccessViewForLevel(b->u.simage.level);
+                    if (uav)
+                        res[RBM_FRAGMENT].uavs.append({ nativeBinding.first, uav });
+                }
             } else {
-                qWarning("Unordered access only supported at compute stage");
+                qWarning("Unordered access only supported at fragment/compute stage");
             }
         }
             break;
@@ -2606,6 +2676,7 @@ void QRhiD3D11::updateShaderResourceBindings(QD3D11ShaderResourceBindings *srbD,
     res[RBM_FRAGMENT].buildSamplerBatches(srbD->fsSamplerBatches);
     res[RBM_COMPUTE].buildSamplerBatches(srbD->csSamplerBatches);
 
+    res[RBM_FRAGMENT].buildUavBatches(srbD->fsUavBatches);
     res[RBM_COMPUTE].buildUavBatches(srbD->csUavBatches);
 }
 
@@ -2727,7 +2798,9 @@ static inline uint clampedResourceCount(uint startSlot, int countSlots, uint max
 
 void QRhiD3D11::bindShaderResources(QD3D11ShaderResourceBindings *srbD,
                                     const uint *dynOfsPairs, int dynOfsPairCount,
-                                    bool offsetOnlyChange)
+                                    bool offsetOnlyChange,
+                                    QD3D11RenderTargetData *rtD,
+                                    RenderTargetUavUpdateState &rtUavState)
 {
     UINT offsets[QD3D11CommandBuffer::MAX_DYNAMIC_OFFSET_COUNT];
 
@@ -2747,10 +2820,27 @@ void QRhiD3D11::bindShaderResources(QD3D11ShaderResourceBindings *srbD,
         SETSAMPLERBATCH(cs, CS)
 
         SETUAVBATCH(cs, CS)
+
+        if (srbD->fsUavBatches.present) {
+            for (const auto &batch : srbD->fsUavBatches.uavs.batches) {
+                const uint count = qMin(clampedResourceCount(batch.startBinding, batch.resources.count(),
+                                                        D3D11_1_UAV_SLOT_COUNT, "fs UAV"),
+                                        uint(QD3D11RenderTargetData::MAX_COLOR_ATTACHMENTS));
+                if (count) {
+                    if (rtUavState.update(rtD, batch.resources.constData(), count)) {
+                        context->OMSetRenderTargetsAndUnorderedAccessViews(UINT(rtD->colorAttCount), rtD->colorAttCount ? rtD->rtv : nullptr, rtD->dsv,
+                                                                           UINT(rtD->colorAttCount), count, batch.resources.constData(), nullptr);
+                    }
+                    contextState.fsHighestActiveUavBinding = qMax(contextState.fsHighestActiveUavBinding,
+                                                                  int(batch.startBinding + count) - 1);
+                }
+            }
+        }
     }
 }
 
-void QRhiD3D11::resetShaderResources()
+void QRhiD3D11::resetShaderResources(QD3D11RenderTargetData *rtD,
+                                     RenderTargetUavUpdateState &rtUavState)
 {
     // Output cannot be bound on input etc.
 
@@ -2811,6 +2901,11 @@ void QRhiD3D11::resetShaderResources()
         }
     }
 
+    if (contextState.fsHighestActiveUavBinding >= 0) {
+        rtUavState.update(rtD);
+        context->OMSetRenderTargetsAndUnorderedAccessViews(UINT(rtD->colorAttCount), rtD->colorAttCount ? rtD->rtv : nullptr, rtD->dsv, 0, 0, nullptr, nullptr);
+        contextState.fsHighestActiveUavBinding = -1;
+    }
     if (contextState.csHighestActiveUavBinding >= 0) {
         const int nulluavCount = contextState.csHighestActiveUavBinding + 1;
         QVarLengthArray<ID3D11UnorderedAccessView *,
@@ -2844,6 +2939,10 @@ void QRhiD3D11::executeCommandBuffer(QD3D11CommandBuffer *cbD)
     };
     int currentShaderMask = 0xFF;
 
+    // Track render target and uav updates during executeCommandBuffer.
+    // Prevents multiple identical OMSetRenderTargetsAndUnorderedAccessViews calls.
+    RenderTargetUavUpdateState rtUavState;
+
     for (auto it = cbD->commands.cbegin(), end = cbD->commands.cend(); it != end; ++it) {
         const QD3D11CommandBuffer::Command &cmd(*it);
         switch (cmd.cmd) {
@@ -2857,7 +2956,9 @@ void QRhiD3D11::executeCommandBuffer(QD3D11CommandBuffer *cbD)
                     // it around by issuing a semi-fake OMSetRenderTargets early and
                     // writing the first timestamp only afterwards.
                     QD3D11RenderTargetData *rtD = cmd.args.beginFrame.swapchainData;
+                    rtUavState.update(rtD);
                     context->OMSetRenderTargets(UINT(rtD->colorAttCount), rtD->colorAttCount ? rtD->rtv : nullptr, rtD->dsv);
+                    cbD->prevRtD = rtD;
                 }
                 context->End(cmd.args.beginFrame.tsQuery); // no Begin() for D3D11_QUERY_TIMESTAMP
             }
@@ -2869,12 +2970,14 @@ void QRhiD3D11::executeCommandBuffer(QD3D11CommandBuffer *cbD)
                 context->End(cmd.args.endFrame.tsDisjointQuery);
             break;
         case QD3D11CommandBuffer::Command::ResetShaderResources:
-            resetShaderResources();
+            resetShaderResources(cbD->prevRtD, rtUavState);
             break;
         case QD3D11CommandBuffer::Command::SetRenderTarget:
         {
             QD3D11RenderTargetData *rtD = rtData(cmd.args.setRenderTarget.rt);
-            context->OMSetRenderTargets(UINT(rtD->colorAttCount), rtD->colorAttCount ? rtD->rtv : nullptr, rtD->dsv);
+            if (rtUavState.update(rtD))
+                context->OMSetRenderTargets(UINT(rtD->colorAttCount), rtD->colorAttCount ? rtD->rtv : nullptr, rtD->dsv);
+            cbD->prevRtD = rtD;
         }
             break;
         case QD3D11CommandBuffer::Command::Clear:
@@ -2951,7 +3054,9 @@ void QRhiD3D11::executeCommandBuffer(QD3D11CommandBuffer *cbD)
             bindShaderResources(cmd.args.bindShaderResources.srb,
                                 cmd.args.bindShaderResources.dynamicOffsetPairs,
                                 cmd.args.bindShaderResources.dynamicOffsetCount,
-                                cmd.args.bindShaderResources.offsetOnlyChange);
+                                cmd.args.bindShaderResources.offsetOnlyChange,
+                                cbD->prevRtD,
+                                rtUavState);
             break;
         case QD3D11CommandBuffer::Command::StencilRef:
             stencilRef = cmd.args.stencilRef.ref;
@@ -5667,5 +5772,32 @@ bool QD3D11SwapChain::createOrResize()
 
     return true;
 }
+
+bool RenderTargetUavUpdateState::update(QD3D11RenderTargetData *data, ID3D11UnorderedAccessView *const *uavs, int count)
+{
+    bool ret = false;
+    if (dsv != data->dsv) {
+        dsv = data->dsv;
+        ret = true;
+    }
+    for (int i = 0; i < data->colorAttCount; i++) {
+        ret |= rtv[i] != data->rtv[i];
+        rtv[i] = data->rtv[i];
+    }
+    for (int i = data->colorAttCount; i < QD3D11RenderTargetData::MAX_COLOR_ATTACHMENTS; i++) {
+        ret |= rtv[i] != nullptr;
+        rtv[i] = nullptr;
+    }
+    for (int i = 0; i < count; i++) {
+        ret |= uav[i] != uavs[i];
+        uav[i] = uavs[i];
+    }
+    for (int i = count; i < QD3D11RenderTargetData::MAX_COLOR_ATTACHMENTS; i++) {
+        ret |= uav[i] != nullptr;
+        uav[i] = nullptr;
+    }
+    return ret;
+}
+
 
 QT_END_NAMESPACE

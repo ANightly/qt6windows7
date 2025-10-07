@@ -479,4 +479,4 @@ namespace QLegacyShims {
 	}
 }
 
-#endif // QLEGACYSHIMS_P_H
+#endif // QLEGACYSHIMS_P_H

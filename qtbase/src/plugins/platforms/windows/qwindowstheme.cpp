@@ -40,9 +40,9 @@
 #include <QtGui/private/qabstractfileiconengine_p.h>
 #include <QtGui/private/qwindowsfontdatabase_p.h>
 #include <private/qhighdpiscaling_p.h>
-#include <private/qsystemlibrary_p.h>
 #include <private/qwinregistry_p.h>
 #include <QtCore/private/qfunctions_win_p.h>
+#include <QtGui/private/qwindowsthemecache_p.h>
 
 #include <algorithm>
 
@@ -96,6 +96,12 @@ static constexpr QColor getSysColor(winrt::Windows::UI::Color &&color)
 }
 #endif
 
+static inline QColor getSysColor(int index)
+{
+    COLORREF cr = GetSysColor(index);
+    return QColor(GetRValue(cr), GetGValue(cr), GetBValue(cr));
+}
+
 [[maybe_unused]] [[nodiscard]] static inline QColor qt_accentColor(AccentColorLevel level)
 {
     QColor accent;
@@ -107,7 +113,7 @@ static constexpr QColor getSysColor(winrt::Windows::UI::Color &&color)
     QColor accentDarkest;
 #if QT_CONFIG(cpp_winrt)
     if (IsWindows10OrGreater()) {
-    using namespace winrt::Windows::UI::ViewManagement;
+        using namespace winrt::Windows::UI::ViewManagement;
         const auto settings = UISettings();
         accent = getSysColor(settings.GetColorValue(UIColorType::Accent));
         accentLight = getSysColor(settings.GetColorValue(UIColorType::AccentLight1));
@@ -116,7 +122,41 @@ static constexpr QColor getSysColor(winrt::Windows::UI::Color &&color)
         accentDark = getSysColor(settings.GetColorValue(UIColorType::AccentDark1));
         accentDarker = getSysColor(settings.GetColorValue(UIColorType::AccentDark2));
         accentDarkest = getSysColor(settings.GetColorValue(UIColorType::AccentDark3));
-    } else {
+   } else {
+       accent = []()->QColor {
+            // MS uses the aquatic contrast theme as an example in the URL below:
+            // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsyscolor#windows-1011-system-colors
+            if (QWindowsTheme::queryHighContrast())
+                return getSysColor(COLOR_HIGHLIGHT);
+            const QWinRegistryKey registry(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\DWM)");
+            if (!registry.isValid())
+                return {};
+            const QVariant value = registry.value(L"AccentColor");
+            if (!value.isValid())
+                return {};
+            // The retrieved value is in the #AABBGGRR format, we need to
+            // convert it to the #AARRGGBB format which Qt expects.
+            const QColor abgr = QColor::fromRgba(qvariant_cast<DWORD>(value));
+            if (!abgr.isValid())
+                return {};
+            return QColor::fromRgb(abgr.blue(), abgr.green(), abgr.red(), abgr.alpha());
+        }();
+        if (!accent.isValid())
+            return {};
+
+        accentLight = accent.lighter(120);
+        accentLighter = accentLight.lighter(120);
+        accentLightest = accentLighter.lighter(120);
+        accentDark = accent.darker(120);
+        accentDarker = accentDark.darker(120);
+        accentDarkest = accentDarker.darker(120);
+   }
+#else
+    accent = []()->QColor {
+        // MS uses the aquatic contrast theme as an example in the URL below:
+        // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsyscolor#windows-1011-system-colors
+        if (QWindowsTheme::queryHighContrast())
+            return getSysColor(COLOR_HIGHLIGHT);
         const QWinRegistryKey registry(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\DWM)");
         if (!registry.isValid())
             return {};
@@ -128,33 +168,18 @@ static constexpr QColor getSysColor(winrt::Windows::UI::Color &&color)
         const QColor abgr = QColor::fromRgba(qvariant_cast<DWORD>(value));
         if (!abgr.isValid())
             return {};
-        accent = QColor::fromRgb(abgr.blue(), abgr.green(), abgr.red(), abgr.alpha());
-        accentLight = accent.lighter(120);
-        accentLighter = accentLight.lighter(120);
-        accentLightest = accentLighter.lighter(120);
-        accentDark = accent.darker(120);
-        accentDarker = accentDark.darker(120);
-        accentDarkest = accentDarker.darker(120);
-    }
-#else
-    const QWinRegistryKey registry(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\DWM)");
-    if (!registry.isValid())
+        return QColor::fromRgb(abgr.blue(), abgr.green(), abgr.red(), abgr.alpha());
+
+    }();
+    if (!accent.isValid())
         return {};
-    const QVariant value = registry.value(L"AccentColor");
-    if (!value.isValid())
-        return {};
-    // The retrieved value is in the #AABBGGRR format, we need to
-    // convert it to the #AARRGGBB format which Qt expects.
-    const QColor abgr = QColor::fromRgba(qvariant_cast<DWORD>(value));
-    if (!abgr.isValid())
-        return {};
-    const QColor accent = QColor::fromRgb(abgr.blue(), abgr.green(), abgr.red(), abgr.alpha());
-    const QColor accentLight = accent.lighter(120);
-    const QColor accentLighter = accentLight.lighter(120);
-    const QColor accentLightest = accentLighter.lighter(120);
-    const QColor accentDark = accent.darker(120);
-    const QColor accentDarker = accentDark.darker(120);
-    const QColor accentDarkest = accentDarker.darker(120);
+
+    accentLight = accent.lighter(120);
+    accentLighter = accentLight.lighter(120);
+    accentLightest = accentLighter.lighter(120);
+    accentDark = accent.darker(120);
+    accentDarker = accentDark.darker(120);
+    accentDarkest = accentDarker.darker(120);
 #endif
     switch (level) {
     case AccentColorDarkest:
@@ -172,12 +197,6 @@ static constexpr QColor getSysColor(winrt::Windows::UI::Color &&color)
     default:
         return accent;
     }
-}
-
-static inline QColor getSysColor(int index)
-{
-    COLORREF cr = GetSysColor(index);
-    return QColor(GetRValue(cr), GetGValue(cr), GetBValue(cr));
 }
 
 // QTBUG-48823/Windows 10: SHGetFileInfo() (as called by item views on file system
@@ -520,6 +539,39 @@ static inline QPalette *menuBarPalette(const QPalette &menuPalette, bool light)
 const char *QWindowsTheme::name = "windows";
 QWindowsTheme *QWindowsTheme::m_instance = nullptr;
 
+LRESULT QT_WIN_CALLBACK qThemeChangeObserverWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message) {
+    case WM_SETTINGCHANGE:
+        // Only refresh the theme if the user changes the personalize settings
+        if (!((wParam == 0) && (lParam != 0) // lParam sometimes may be NULL.
+            && (wcscmp(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") == 0)))
+            break;
+        Q_FALLTHROUGH();
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+        qCDebug(lcQpaTheme) << "Handling theme change due to"
+            << qUtf8Printable(decodeMSG(MSG{hwnd, message, wParam, lParam, 0, {0, 0}}).trimmed());
+        QWindowsTheme::handleThemeChange();
+
+        MSG msg; // Clear the message queue, we've already reacted to the change
+        while (PeekMessage(&msg, hwnd, 0, 0, PM_REMOVE));
+
+        // FIXME: Despite clearing the message queue above, Windows will send
+        // us redundant theme change events for our single window. We want the
+        // theme change delivery to be synchronous, so we can't easily debounce
+        // them by peeking into the QWSI event queue, but perhaps there are other
+        // ways.
+
+        break;
+    default:
+        break;
+    }
+
+    return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
 QWindowsTheme::QWindowsTheme()
 {
     m_instance = this;
@@ -529,6 +581,16 @@ QWindowsTheme::QWindowsTheme()
     std::fill(m_palettes, m_palettes + NPalettes, nullptr);
     refresh();
     refreshIconPixmapSizes();
+
+    auto className = QWindowsContext::instance()->registerWindowClass(
+        QWindowsContext::classNamePrefix() + QLatin1String("ThemeChangeObserverWindow"),
+        qThemeChangeObserverWndProc);
+    // HWND_MESSAGE windows do not get the required theme events,
+    // so we use a real top-level window that we never show.
+    m_themeChangeObserver = CreateWindowEx(0, reinterpret_cast<LPCWSTR>(className.utf16()),
+        nullptr, WS_TILED, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    Q_ASSERT(m_themeChangeObserver);
 }
 
 QWindowsTheme::~QWindowsTheme()
@@ -536,6 +598,13 @@ QWindowsTheme::~QWindowsTheme()
     clearPalettes();
     clearFonts();
     m_instance = nullptr;
+}
+
+void QWindowsTheme::destroyThemeChangeWindow()
+{
+    qCDebug(lcQpaTheme) << "Destroying theme change window";
+    DestroyWindow(m_themeChangeObserver);
+    m_themeChangeObserver = nullptr;
 }
 
 static inline QStringList iconThemeSearchPaths()
@@ -634,26 +703,36 @@ Qt::ColorScheme QWindowsTheme::effectiveColorScheme()
 void QWindowsTheme::requestColorScheme(Qt::ColorScheme scheme)
 {
     s_colorSchemeOverride = scheme;
-    handleSettingsChanged();
+    handleThemeChange();
 }
 
-void QWindowsTheme::handleSettingsChanged()
+Qt::ContrastPreference QWindowsTheme::contrastPreference() const
 {
+    return queryHighContrast() ? Qt::ContrastPreference::HighContrast
+                               : Qt::ContrastPreference::NoPreference;
+}
+
+void QWindowsTheme::handleThemeChange()
+{
+    QWindowsThemeCache::clearAllThemeCaches();
+
     const auto oldColorScheme = s_colorScheme;
     s_colorScheme = Qt::ColorScheme::Unknown; // make effectiveColorScheme() query registry
-    const auto newColorScheme = effectiveColorScheme();
-    const bool colorSchemeChanged = newColorScheme != oldColorScheme;
-    s_colorScheme = newColorScheme;
-    if (!colorSchemeChanged)
-        return;
-    auto integration = QWindowsIntegration::instance();
-    integration->updateApplicationBadge();
-    if (integration->darkModeHandling().testFlag(QWindowsApplication::DarkModeStyle)) {
-        QWindowsTheme::instance()->refresh();
-        QWindowSystemInterface::handleThemeChange<QWindowSystemInterface::SynchronousDelivery>();
+    s_colorScheme = effectiveColorScheme();
+    if (s_colorScheme != oldColorScheme) {
+        // Only propagate color scheme changes if the scheme actually changed
+        auto integration = QWindowsIntegration::instance();
+        integration->updateApplicationBadge();
+
+        for (QWindowsWindow *w : std::as_const(QWindowsContext::instance()->windows()))
+            w->setDarkBorder(s_colorScheme == Qt::ColorScheme::Dark);
     }
-    for (QWindowsWindow *w : std::as_const(QWindowsContext::instance()->windows()))
-        w->setDarkBorder(s_colorScheme == Qt::ColorScheme::Dark);
+
+    // But always reset palette and fonts, and signal the theme
+    // change, as other parts of the theme could have changed,
+    // such as the accent color.
+    QWindowsTheme::instance()->refresh();
+    QWindowSystemInterface::handleThemeChange<QWindowSystemInterface::SynchronousDelivery>();
 }
 
 void QWindowsTheme::clearPalettes()
@@ -827,12 +906,6 @@ QPlatformSystemTrayIcon *QWindowsTheme::createPlatformSystemTrayIcon() const
 }
 #endif
 
-void QWindowsTheme::windowsThemeChanged(QWindow * window)
-{
-    refresh();
-    QWindowSystemInterface::handleThemeChange(window);
-}
-
 static int fileIconSizes[FileIconSizeCount];
 
 void QWindowsTheme::refreshIconPixmapSizes()
@@ -854,15 +927,15 @@ Q_GUI_EXPORT QPixmap qt_pixmapFromWinHICON(HICON icon);
 
 static QPixmap loadIconFromShell32(int resourceId, QSizeF size)
 {
-    if (const HMODULE hmod = QSystemLibrary::load(L"shell32")) {
-        auto iconHandle =
-            static_cast<HICON>(LoadImage(hmod, MAKEINTRESOURCE(resourceId),
-                                         IMAGE_ICON, int(size.width()), int(size.height()), 0));
-        if (iconHandle) {
-            QPixmap iconpixmap = qt_pixmapFromWinHICON(iconHandle);
-            DestroyIcon(iconHandle);
-            return iconpixmap;
-        }
+    HMODULE shell32 = ::GetModuleHandleW(L"shell32.dll");
+    Q_ASSERT(shell32);
+    auto iconHandle =
+        static_cast<HICON>(LoadImage(shell32, MAKEINTRESOURCE(resourceId),
+                                     IMAGE_ICON, int(size.width()), int(size.height()), 0));
+    if (iconHandle) {
+        QPixmap iconpixmap = qt_pixmapFromWinHICON(iconHandle);
+        DestroyIcon(iconHandle);
+        return iconpixmap;
     }
     return QPixmap();
 }

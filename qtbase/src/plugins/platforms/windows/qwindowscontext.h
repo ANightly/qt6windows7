@@ -30,6 +30,7 @@ Q_DECLARE_LOGGING_CATEGORY(lcQpaAccessibility)
 Q_DECLARE_LOGGING_CATEGORY(lcQpaUiAutomation)
 Q_DECLARE_LOGGING_CATEGORY(lcQpaTrayIcon)
 Q_DECLARE_LOGGING_CATEGORY(lcQpaScreen)
+Q_DECLARE_LOGGING_CATEGORY(lcQpaTheme)
 
 class QWindow;
 class QPlatformScreen;
@@ -146,7 +147,7 @@ public:
         SI_SupportsTouch = 0x2
     };
 
-    // Verbose flag set by environment variable QT_QPA_VERBOSE
+    // Verbose flag set by the `verbose` platform plugin argument
     static int verbose;
 
     explicit QWindowsContext();
@@ -260,7 +261,7 @@ private:
     static QWindowsContext *m_instance;
 };
 
-extern "C" LRESULT QT_WIN_CALLBACK qWindowsWndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT QT_WIN_CALLBACK qWindowsWndProc(HWND, UINT, WPARAM, LPARAM);
 
 QT_END_NAMESPACE
 
